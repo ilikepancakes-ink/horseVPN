@@ -2,8 +2,12 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
+# Install git for direct module fetching
+RUN apk add --no-cache git
+
 # Copy go mod files
 COPY go.mod ./
+ENV GOPROXY=direct
 RUN go mod download
 
 # Copy source code
