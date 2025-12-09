@@ -1,0 +1,5 @@
+client/flutter/ephemeral
+.dart_tool/
+build/
+/sync-server/node_modules/
+/routing-server/node_modules/

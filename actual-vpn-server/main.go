@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -93,25 +99,151 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go tunnel.handleConnection()
 }
 
+type ServerRegistration struct {
+	ID      string `json:"id"`
+	Location string `json:"location"`
+	URL     string `json:"url"`
+}
+
+func getCloudflaredDomain() (string, error) {
+	// Try to get cloudflared tunnel info
+	resp, err := http.Get("http://localhost:4040/api/tunnels")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Tunnels []struct {
+			Name      string `json:"name"`
+			PublicURL string `json:"public_url"`
+		} `json:"tunnels"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	// Find the tunnel for our service
+	for _, tunnel := range result.Tunnels {
+		if strings.Contains(tunnel.Name, "horsevpn") || strings.Contains(tunnel.Name, "vpn") {
+			return tunnel.PublicURL, nil
+		}
+	}
+
+	// If no specific tunnel found, return the first one
+	if len(result.Tunnels) > 0 {
+		return result.Tunnels[0].PublicURL, nil
+	}
+
+	return "", fmt.Errorf("no cloudflared tunnel found")
+}
+
+func registerWithSyncServer(serverID, location, url, syncServerURL string) error {
+	reg := ServerRegistration{
+		ID:       serverID,
+		Location: location,
+		URL:      url,
+	}
+
+	data, err := json.Marshal(reg)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(syncServerURL+"/register", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("registration failed with status: %d", resp.StatusCode)
+	}
+
+	log.Printf("Successfully registered with sync server: %s at %s", serverID, location)
+	return nil
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
 func main() {
+	var noCloudflared = flag.Bool("no-cloudflared", false, "Skip waiting for cloudflared domain")
+	var location = flag.String("location", "unknown", "Server location")
+	var syncServer = flag.String("sync-server", "https://vpnmanager.0x409.nl", "Sync server URL")
+	var serverID = flag.String("id", "", "Server ID (auto-generated if empty)")
+	flag.Parse()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
+	// Generate server ID if not provided
+	if *serverID == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			hostname = "unknown"
+		}
+		*serverID = fmt.Sprintf("%s-%d", hostname, time.Now().Unix())
+	}
+
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/health", handleHealth)
 
-	log.Printf("HorseVPN WebSocket server starting on port %s", port)
-	log.Printf("WebSocket endpoint: ws://localhost:%s/ws", port)
-	log.Printf("Health check: http://localhost:%s/health", port)
+	server := &http.Server{Addr: ":" + port}
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal("Server failed to start:", err)
+	// Start server in background
+	go func() {
+		log.Printf("HorseVPN WebSocket server starting on port %s", port)
+		log.Printf("WebSocket endpoint: ws://localhost:%s/ws", port)
+		log.Printf("Health check: http://localhost:%s/health", port)
+
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server failed to start:", err)
+		}
+	}()
+
+	// Wait for server to be ready
+	time.Sleep(2 * time.Second)
+
+	var domain string
+	if *noCloudflared {
+		// Use localhost if no cloudflared
+		domain = fmt.Sprintf("ws://localhost:%s/ws", port)
+		log.Printf("Skipping cloudflared, using localhost domain: %s", domain)
+	} else {
+		// Wait for cloudflared domain
+		log.Printf("Waiting for cloudflared domain...")
+		for {
+			d, err := getCloudflaredDomain()
+			if err != nil {
+				log.Printf("Waiting for cloudflared tunnel: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			domain = strings.Replace(d, "https://", "wss://", 1)
+			domain = strings.Replace(domain, "http://", "ws://", 1)
+			domain += "/ws"
+			log.Printf("Cloudflared domain detected: %s", domain)
+			break
+		}
 	}
+
+	// Register with sync server
+	for {
+		err := registerWithSyncServer(*serverID, *location, domain, *syncServer)
+		if err != nil {
+			log.Printf("Failed to register with sync server: %v, retrying...", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		break
+	}
+
+	// Keep server running
+	select {}
 }

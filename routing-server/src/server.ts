@@ -16,9 +16,9 @@ cacheDb.run(`CREATE TABLE IF NOT EXISTS cache (ip TEXT PRIMARY KEY, server TEXT)
 
 async function syncServerList() {
   try {
-    const response = await axios.get('https://applications.ilikepancakes.gay/vpn/list.db');
+    const response = await axios.get(process.env.SYNC_SERVER_URL || 'https://vpnhelper.0x409.nl/list');
     serverList = response.data as Server[];
-    console.log('Synced server list from remote');
+    console.log('Synced server list from sync server');
   } catch (error) {
     console.log('Failed to sync server list, using fallback');
     serverList = [fallbackServer];
@@ -58,6 +58,23 @@ app.post('/route', async (req, res) => {
     }
     res.send(server);
   } catch (error) {
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+// Endpoint for sync server to push updated server list
+app.post('/update-servers', (req, res) => {
+  try {
+    const newServerList: Server[] = req.body;
+    if (!Array.isArray(newServerList)) {
+      return res.status(400).json({ error: 'Expected array of servers' });
+    }
+
+    serverList = newServerList;
+    console.log(`Updated server list from sync server. Total servers: ${serverList.length}`);
+    res.json({ status: 'updated', serverCount: serverList.length });
+  } catch (error) {
+    console.log('Error updating server list:', (error as Error).message);
     res.status(500).send('Internal Server Error');
   }
 });

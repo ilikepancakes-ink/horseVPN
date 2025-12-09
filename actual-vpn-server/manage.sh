@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 print_help() {
-    echo "HorseVPN WebSocket Server Management Script"
+    echo "HorseVPN WebSocket Server Management Service"
     echo ""
     echo "Usage: $0 [COMMAND]"
     echo ""
@@ -37,6 +37,27 @@ start_server() {
     echo -e "${BLUE}Starting HorseVPN WebSocket server...${NC}"
 
     cd "$SCRIPT_DIR"
+
+    # Parse additional arguments for the server
+    SERVER_ARGS=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --no-cloudflared|--location=*|--sync-server=*|--id=*)
+                SERVER_ARGS="$SERVER_ARGS $1"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ -n "$SERVER_ARGS" ]; then
+        echo -e "${BLUE}Server arguments: ${YELLOW}$SERVER_ARGS${NC}"
+        # For Docker, we'd need to modify the compose file or use environment variables
+        # For now, just note that these arguments would be passed to the container
+    fi
+
     docker-compose up -d
 
     echo -e "${GREEN}WebSocket server started!${NC}"
