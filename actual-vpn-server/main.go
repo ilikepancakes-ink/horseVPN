@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -74,8 +75,36 @@ func (t *Tunnel) copyData(src, dst Conn) {
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all origins for now
+			// Allow connections from trusted domains only
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return false // Reject requests without Origin header
+			}
+
+			// Allow localhost for development and trusted domains
+			allowedOrigins := []string{
+				"http://localhost",
+				"https://localhost",
+				"http://127.0.0.1",
+				"https://127.0.0.1",
+			}
+
+			// Add production domains if set via environment
+			if trustedDomains := os.Getenv("TRUSTED_DOMAINS"); trustedDomains != "" {
+				domains := strings.Split(trustedDomains, ",")
+				allowedOrigins = append(allowedOrigins, domains...)
+			}
+
+			for _, allowed := range allowedOrigins {
+				if strings.TrimSpace(allowed) == origin {
+					return true
+				}
+			}
+
+			log.Printf("Rejected WebSocket connection from untrusted origin: %s", origin)
+			return false
 		},
+		Subprotocols: []string{"vpn-protocol"}, // Enforce specific subprotocol
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -182,6 +211,10 @@ func main() {
 		port = "8080"
 	}
 
+	useTLS := os.Getenv("USE_TLS") == "true"
+	certFile := os.Getenv("TLS_CERT_FILE")
+	keyFile := os.Getenv("TLS_KEY_FILE")
+
 	// Generate server ID if not provided
 	if *serverID == "" {
 		hostname, err := os.Hostname()
@@ -194,16 +227,45 @@ func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/health", handleHealth)
 
-	server := &http.Server{Addr: ":" + port}
+	server := &http.Server{
+		Addr: ":" + port,
+		// Security headers
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		TLSConfig: &tls.Config{
+			MinVersion:               tls.VersionTLS12,
+			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+			PreferServerCipherSuites: true,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			},
+		},
+	}
 
 	// Start server in background
 	go func() {
-		log.Printf("HorseVPN WebSocket server starting on port %s", port)
-		log.Printf("WebSocket endpoint: ws://localhost:%s/ws", port)
-		log.Printf("Health check: http://localhost:%s/health", port)
+		if useTLS && certFile != "" && keyFile != "" {
+			log.Printf("HorseVPN WebSocket server starting on port %s with TLS", port)
+			log.Printf("WebSocket endpoint: wss://localhost:%s/ws", port)
+			log.Printf("Health check: https://localhost:%s/health", port)
 
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("Server failed to start:", err)
+			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatal("HTTPS server failed to start:", err)
+			}
+		} else {
+			log.Printf("HorseVPN WebSocket server starting on port %s", port)
+			log.Printf("WebSocket endpoint: ws://localhost:%s/ws", port)
+			log.Printf("Health check: http://localhost:%s/health", port)
+
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatal("HTTP server failed to start:", err)
+			}
 		}
 	}()
 

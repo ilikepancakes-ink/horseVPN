@@ -1,6 +1,11 @@
 import express from 'express';
 import axios from 'axios';
 import sqlite3 from 'sqlite3';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import https from 'https';
+import fs from 'fs';
+import crypto from 'crypto';
 
 interface Server {
   id: string;
@@ -110,7 +115,43 @@ async function healthCheck() {
 }
 
 const app = express();
-app.use(express.json());
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 registration requests per windowMs
+  message: 'Too many registration attempts from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(limiter);
+app.use(express.json({ limit: '10mb' }));
 
 // Get server list (for routing server)
 app.get('/list', (req, res) => {
@@ -122,30 +163,63 @@ app.get('/list', (req, res) => {
 });
 
 // Register a new VPN server
-app.post('/register', async (req, res) => {
+app.post('/register', strictLimiter, async (req, res) => {
   const { id, location, url } = req.body;
 
+  // Input validation
   if (!id || !location || !url) {
     return res.status(400).json({ error: 'Missing required fields: id, location, url' });
   }
 
+  // Validate ID format (alphanumeric, dash, underscore only)
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    return res.status(400).json({ error: 'Invalid server ID format' });
+  }
+
+  // Validate location
+  if (typeof location !== 'string' || location.length === 0 || location.length > 100) {
+    return res.status(400).json({ error: 'Invalid location' });
+  }
+
+  // Validate URL format
+  if (!url.startsWith('wss://') && !url.startsWith('ws://')) {
+    return res.status(400).json({ error: 'Invalid URL: must use ws:// or wss:// protocol' });
+  }
+
+  try {
+    new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL format' });
+  }
+
+  // Check for duplicate server ID
+  if (servers.has(id)) {
+    return res.status(409).json({ error: 'Server ID already exists' });
+  }
+
+  // Generate secure server ID if not provided or override insecure ones
+  let secureId = id;
+  if (!id || id.length < 8) {
+    secureId = crypto.randomBytes(16).toString('hex');
+  }
+
   const server: Server = {
-    id,
+    id: secureId,
     location,
     url,
     registeredAt: Date.now(),
     lastSeen: Date.now()
   };
 
-  servers.set(id, server);
+  servers.set(secureId, server);
   saveServerToDB(server);
 
-  console.log(`Registered new server: ${id} at ${location} (${url})`);
+  console.log(`Registered new server: ${secureId} at ${location} (${url})`);
 
   // Push updated server list to routing server
   await pushServerListToRoutingServer();
 
-  res.json({ status: 'registered' });
+  res.json({ status: 'registered', serverId: secureId });
 });
 
 // Health check endpoint for the sync server itself
@@ -153,7 +227,10 @@ app.get('/health', (req, res) => {
   res.send('OK');
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = parseInt(process.env.PORT || '3001');
+const USE_HTTPS = process.env.USE_HTTPS === 'true';
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH || './ssl/key.pem';
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH || './ssl/cert.pem';
 
 async function startServer() {
   loadServersFromDB();
@@ -161,11 +238,33 @@ async function startServer() {
   // Start health checking every 5 minutes
   setInterval(healthCheck, 5 * 60 * 1000);
 
-  app.listen(PORT, () => {
-    console.log(`Sync server listening on port ${PORT}`);
-    console.log(`Server list endpoint: http://localhost:${PORT}/list`);
-    console.log(`Registration endpoint: http://localhost:${PORT}/register`);
-  });
+  if (USE_HTTPS && fs.existsSync(SSL_KEY_PATH) && fs.existsSync(SSL_CERT_PATH)) {
+    try {
+      const httpsOptions = {
+        key: fs.readFileSync(SSL_KEY_PATH),
+        cert: fs.readFileSync(SSL_CERT_PATH),
+      };
+
+      const server = https.createServer(httpsOptions, app);
+      server.listen(PORT, () => {
+        console.log(`Sync server listening on HTTPS port ${PORT}`);
+        console.log('SSL/TLS encryption enabled');
+      });
+    } catch (error) {
+      console.error('Failed to start HTTPS server:', error);
+      console.log('Falling back to HTTP...');
+      app.listen(PORT, () => {
+        console.log(`Sync server listening on HTTP port ${PORT} (HTTPS failed)`);
+      });
+    }
+  } else {
+    app.listen(PORT, () => {
+      console.log(`Sync server listening on HTTP port ${PORT}`);
+      if (USE_HTTPS) {
+        console.warn('HTTPS requested but SSL certificates not found');
+      }
+    });
+  }
 }
 
 startServer();
