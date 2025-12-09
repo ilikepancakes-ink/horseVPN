@@ -2,12 +2,12 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Configure DNS to use Cloudflare and Google DNS
-RUN echo 'nameserver 1.1.1.1' > /etc/resolv.conf && \
-    echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
+# Install git for direct module fetching
+RUN apk add --no-cache git
 
 # Copy go mod files
 COPY go.mod ./
+ENV GOPROXY=direct
 RUN go mod download
 
 # Copy source code
